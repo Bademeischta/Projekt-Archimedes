@@ -64,6 +64,7 @@ class SAN(nn.Module):
         self.goal_head = nn.Linear(128, G_dims)
         self.plan_embedding_head = nn.Linear(128, P_count * P_dims)
         self.plan_policy_head = nn.Linear(128, P_count)
+        self.a_sfs_head = nn.Linear(128, 1) # A-SFS Head
 
         self.P_count = P_count
         self.P_dims = P_dims
@@ -82,8 +83,9 @@ class SAN(nn.Module):
         goal_vector = torch.sigmoid(self.goal_head(x))
         plan_embeddings = self.plan_embedding_head(x).view(-1, self.P_count, self.P_dims)
         plan_policy = self.plan_policy_head(x)
+        a_sfs_prediction = self.a_sfs_head(x)
 
-        return goal_vector, plan_embeddings, plan_policy
+        return goal_vector, plan_embeddings, plan_policy, a_sfs_prediction
 
 class PlanToMoveMapper(nn.Module):
     """

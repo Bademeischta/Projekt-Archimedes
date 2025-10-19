@@ -17,8 +17,16 @@ def test_conceptual_graph_search():
     board = chess.Board()
 
     # Run the search
-    move = search.search(board)
+    result = search.search(board)
 
-    # Check that the output is a valid move
+    # Check the output dictionary
+    assert isinstance(result, dict)
+    assert "best_move" in result
+    assert "a_sfs_prediction" in result
+    assert "original_goal_vector" in result
+    assert "board_after_plan" in result
+
+    # Check that the move is valid
+    move = result["best_move"]
     assert isinstance(move, chess.Move)
     assert move in board.legal_moves

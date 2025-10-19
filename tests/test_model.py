@@ -23,7 +23,7 @@ def test_san_forward_pass():
     graph2 = Data(x=torch.randn(64, 16), edge_index=torch.randint(0, 64, (2, 120)))
     batch = Batch.from_data_list([graph1, graph2])
 
-    G_out, P_out, pi_out = model(batch)
+    G_out, P_out, pi_out, a_sfs_out = model(batch)
 
     # Check Goal head output shape
     assert G_out.shape == (2, 20)
@@ -31,3 +31,5 @@ def test_san_forward_pass():
     assert P_out.shape == (2, 5, 256)
     # Check Plan Policy head output shape
     assert pi_out.shape == (2, 5)
+    # Check A-SFS head output shape
+    assert a_sfs_out.shape == (2, 1)

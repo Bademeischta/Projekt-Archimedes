@@ -11,14 +11,14 @@ class ConceptualGraphSearch:
         self.san = san
         self.mapper = mapper
 
-    def search(self, board: chess.Board) -> chess.Move:
+    def search(self, board: chess.Board) -> dict:
         # 1. Get representations
         tensor_board = board_to_tensor(board).unsqueeze(0)
         graph_board = board_to_graph(board)
 
         # 2. SAN forward pass to get the plan
         with torch.no_grad():
-            _, plan_embeddings, plan_policy = self.san(graph_board)
+            goal_vector, plan_embeddings, plan_policy, a_sfs_prediction = self.san(graph_board)
 
         # Select the most likely plan
         best_plan_idx = torch.argmax(plan_policy, dim=1).item()
@@ -36,15 +36,24 @@ class ConceptualGraphSearch:
         final_policy_logits = policy_logits + policy_bias
         final_policy = torch.softmax(final_policy_logits, dim=1)
 
-        # 6. Select and return the best move
+        # 6. Select the best move
         best_move_index = torch.argmax(final_policy, dim=1).item()
 
-        # Convert index to move, ensuring it's legal
-        # (In a real search, we would iterate through legal moves)
-        for move in board.legal_moves:
-            if index_to_move(best_move_index, board) == move:
-                return move
+        predicted_move = index_to_move(best_move_index, board)
 
-        # Fallback to the first legal move if the predicted move is illegal
-        # This is a temporary measure for the skeleton.
-        return next(iter(board.legal_moves))
+        if predicted_move in board.legal_moves:
+            best_move = predicted_move
+        else:
+            # Fallback to the first legal move
+            best_move = next(iter(board.legal_moves))
+
+        # 7. Prepare training context
+        board_after_plan = board.copy()
+        board_after_plan.push(best_move)
+
+        return {
+            "best_move": best_move,
+            "a_sfs_prediction": a_sfs_prediction,
+            "original_goal_vector": goal_vector,
+            "board_after_plan": board_after_plan,
+        }

@@ -57,7 +57,7 @@ def main():
         for batch_graphs, batch_goals, batch_policies in loader:
             optimizer.zero_grad()
 
-            goal_pred, _, policy_pred = model(batch_graphs)
+            goal_pred, _, policy_pred, _ = model(batch_graphs) # Ignore A-SFS output for now
 
             goal_loss = goal_loss_fn(goal_pred, batch_goals)
             policy_loss = policy_loss_fn(policy_pred, batch_policies)

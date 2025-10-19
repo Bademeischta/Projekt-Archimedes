@@ -1,5 +1,6 @@
 import torch
-from src.archimedes.model import TPN
+from src.archimedes.model import TPN, SAN
+from torch_geometric.data import Data, Batch
 
 def test_tpn_forward_pass():
     model = TPN()
@@ -13,3 +14,20 @@ def test_tpn_forward_pass():
 
     # Check value head output shape
     assert value_output.shape == (4, 1)
+
+def test_san_forward_pass():
+    model = SAN()
+
+    # Create a batch of dummy graphs
+    graph1 = Data(x=torch.randn(64, 16), edge_index=torch.randint(0, 64, (2, 100)))
+    graph2 = Data(x=torch.randn(64, 16), edge_index=torch.randint(0, 64, (2, 120)))
+    batch = Batch.from_data_list([graph1, graph2])
+
+    G_out, P_out, pi_out = model(batch)
+
+    # Check Goal head output shape
+    assert G_out.shape == (2, 20)
+    # Check Plan Embedding head output shape
+    assert P_out.shape == (2, 5, 256)
+    # Check Plan Policy head output shape
+    assert pi_out.shape == (2, 5)

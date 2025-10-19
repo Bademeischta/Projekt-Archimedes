@@ -18,10 +18,11 @@ def get_game_result(game):
         return 0.0
 
 def main():
-    parser = argparse.ArgumentParser(description="Create a dataset from PGN files for TPN training.")
+    parser = argparse.ArgumentParser(description="Create a dataset from PGN files.")
     parser.add_argument("--input-dir", type=str, required=True, help="Directory containing PGN files.")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to save the dataset shards.")
     parser.add_argument("--shard-size", type=int, default=10000, help="Number of positions per shard.")
+    parser.add_argument("--dataset-type", type=str, required=True, choices=['tpn', 'san'], help="Type of dataset to create ('tpn' or 'san').")
     args = parser.parse_args()
 
     output_path = Path(args.output_dir)
@@ -38,29 +39,38 @@ def main():
         print(f"Processing {pgn_file}...")
         try:
             with open(pgn_file) as f:
-                while True:
-                    game = chess.pgn.read_game(f)
-                    if game is None:
-                        break
+                if args.dataset_type == 'tpn':
+                    while game := chess.pgn.read_game(f):
+                        game_result = get_game_result(game)
+                        board = game.board()
+                        for node in game.mainline():
+                            move = node.move
+                            tensor_board = board_to_tensor(board.copy())
+                            move_index = move_to_index(move)
 
-                    game_result = get_game_result(game)
-                    board = game.board()
-                    for node in game.mainline():
-                        move = node.move
-                        tensor_board = board_to_tensor(board.copy())
-                        move_index = move_to_index(move)
+                            shard_data.append((tensor_board, move_index, game_result))
+                            total_positions += 1
 
-                        shard_data.append((tensor_board, move_index, game_result))
+                            if len(shard_data) >= args.shard_size:
+                                shard_filename = output_path / f"shard_{shard_num}.pt"
+                                print(f"Saving TPN shard {shard_num} with {len(shard_data)} positions...")
+                                torch.save(shard_data, shard_filename)
+                                shard_data = []
+                                shard_num += 1
+
+                            board.push(move)
+
+                elif args.dataset_type == 'san':
+                    for _, graph_board, comment, _ in pgn_parser(f):
+                        shard_data.append((graph_board, comment))
                         total_positions += 1
 
                         if len(shard_data) >= args.shard_size:
                             shard_filename = output_path / f"shard_{shard_num}.pt"
-                            print(f"Saving shard {shard_num} with {len(shard_data)} positions...")
+                            print(f"Saving SAN shard {shard_num} with {len(shard_data)} positions...")
                             torch.save(shard_data, shard_filename)
                             shard_data = []
                             shard_num += 1
-
-                        board.push(move)
 
         except Exception as e:
             print(f"Error processing file {pgn_file}: {e}")

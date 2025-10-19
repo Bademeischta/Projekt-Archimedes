@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.data import Data
 
 class TPN(nn.Module):
     """
@@ -44,3 +46,41 @@ class TPN(nn.Module):
         v = torch.tanh(self.value_fc2(v))
 
         return p, v
+
+class SAN(nn.Module):
+    """
+    Strategic Abstraction Network (SAN)
+    A Graph Neural Network that takes a graph representation of the board
+    and outputs a goal vector, plan embeddings, and a plan policy.
+    """
+    def __init__(self, in_channels=16, G_dims=20, P_count=5, P_dims=256):
+        super(SAN, self).__init__()
+
+        # Body
+        self.conv1 = GCNConv(in_channels, 128)
+        self.conv2 = GCNConv(128, 128)
+
+        # Heads
+        self.goal_head = nn.Linear(128, G_dims)
+        self.plan_embedding_head = nn.Linear(128, P_count * P_dims)
+        self.plan_policy_head = nn.Linear(128, P_count)
+
+        self.P_count = P_count
+        self.P_dims = P_dims
+
+    def forward(self, data: Data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Body
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+
+        # Global Pooling
+        x = global_mean_pool(x, batch)
+
+        # Heads
+        goal_vector = torch.sigmoid(self.goal_head(x))
+        plan_embeddings = self.plan_embedding_head(x).view(-1, self.P_count, self.P_dims)
+        plan_policy = self.plan_policy_head(x)
+
+        return goal_vector, plan_embeddings, plan_policy

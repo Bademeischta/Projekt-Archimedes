@@ -1,0 +1,9 @@
+[Event "Sample Game"]
+[Site ""]
+[Date ""]
+[Round ""]
+[White ""]
+[Black ""]
+[Result "*"]
+
+1. e4 e5 {This is a comment.} 2. Nf3 *

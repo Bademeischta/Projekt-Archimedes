@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "archimedes"
+version = "0.1.0"
+description = "A chess engine with a dual representation network."
+authors = ["Jules"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+torch-geometric = "^2.3.1"
+python-chess = "^1.999"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.4.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "pytorch_cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"

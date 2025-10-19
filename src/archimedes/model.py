@@ -84,3 +84,20 @@ class SAN(nn.Module):
         plan_policy = self.plan_policy_head(x)
 
         return goal_vector, plan_embeddings, plan_policy
+
+class PlanToMoveMapper(nn.Module):
+    """
+    An MLP that maps a plan embedding to a policy bias vector.
+    """
+    def __init__(self, P_dims=256, policy_dims=4672):
+        super(PlanToMoveMapper, self).__init__()
+        self.fc1 = nn.Linear(P_dims + policy_dims, 1024)
+        self.fc2 = nn.Linear(1024, policy_dims)
+
+    def forward(self, plan_embedding, policy_logits):
+        # Concatenate the plan embedding and policy logits
+        x = torch.cat([plan_embedding, policy_logits], dim=1)
+
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x

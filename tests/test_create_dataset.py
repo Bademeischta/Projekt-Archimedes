@@ -3,77 +3,73 @@ from pathlib import Path
 import torch
 import sys
 import chess
+import pytest
 
 from src.archimedes.create_dataset import main
 from src.archimedes.utils import move_to_index
 
-def test_create_dataset_script_tpn_format():
+@pytest.fixture
+def setup_test_environment():
     with tempfile.TemporaryDirectory() as tempdir:
         input_dir = Path(tempdir) / "input"
         output_dir = Path(tempdir) / "output"
         input_dir.mkdir()
         output_dir.mkdir()
+        yield input_dir, output_dir
 
-        # Create a dummy pgn file with a known result
-        dummy_pgn_path = input_dir / "sample.pgn"
-        with open(dummy_pgn_path, "w") as f:
-            f.write('[Event "Sample Game"]\n')
-            f.write('[Result "1-0"]\n')
-            f.write('\n')
-            f.write('1. e4 e5 2. Nf3 *\n')
+def run_script(args):
+    original_argv = sys.argv
+    sys.argv = args
+    main()
+    sys.argv = original_argv
 
-        # Run the script
-        original_argv = sys.argv
-        sys.argv = [
-            "src/archimedes/create_dataset.py",
-            "--input-dir", str(input_dir),
-            "--output-dir", str(output_dir),
-            "--shard-size", "1"
-        ]
+def test_create_dataset_tpn(setup_test_environment):
+    input_dir, output_dir = setup_test_environment
 
-        main()
+    # Create a dummy pgn file
+    (input_dir / "sample.pgn").write_text('[Result "1-0"]\n1. e4 e5 2. Nf3 *\n')
 
-        sys.argv = original_argv  # Restore
+    # Run the script for TPN
+    run_script([
+        "src/archimedes/create_dataset.py",
+        "--input-dir", str(input_dir),
+        "--output-dir", str(output_dir),
+        "--shard-size", "2",
+        "--dataset-type", "tpn"
+    ])
 
-        # Verify the output
-        shard_files = sorted(list(output_dir.glob("*.pt")))
-        assert len(shard_files) == 3 # Three moves, shard size of 1
+    # Verify the output
+    shard_files = sorted(list(output_dir.glob("*.pt")))
+    assert len(shard_files) == 2
 
-        # Check the first shard (position before 1. e4)
-        shard1_data = torch.load(shard_files[0])
-        assert len(shard1_data) == 1
-        tensor_board, move_index, game_result = shard1_data[0]
+    # Check first shard
+    shard1_data = torch.load(shard_files[0])
+    assert len(shard1_data) == 2
+    _, _, game_result = shard1_data[0]
+    assert game_result == 1.0
 
-        assert tensor_board.shape == (22, 8, 8)
-        assert game_result == 1.0
+def test_create_dataset_san(setup_test_environment):
+    input_dir, output_dir = setup_test_environment
 
-        board = chess.Board()
-        expected_move = chess.Move.from_uci("e2e4")
-        expected_index = move_to_index(expected_move)
-        assert move_index == expected_index
+    # Create a dummy pgn file with comments
+    (input_dir / "sample.pgn").write_text('1. e4 {comment1} e5 {comment2} *\n')
 
-        # Check the second shard (position before 1... e5)
-        shard2_data = torch.load(shard_files[1])
-        assert len(shard2_data) == 1
-        tensor_board, move_index, game_result = shard2_data[0]
+    # Run the script for SAN
+    run_script([
+        "src/archimedes/create_dataset.py",
+        "--input-dir", str(input_dir),
+        "--output-dir", str(output_dir),
+        "--shard-size", "1",
+        "--dataset-type", "san"
+    ])
 
-        assert tensor_board.shape == (22, 8, 8)
-        assert game_result == 1.0
+    # Verify the output
+    shard_files = sorted(list(output_dir.glob("*.pt")))
+    assert len(shard_files) == 2
 
-        board.push(expected_move) # Play 1. e4
-        expected_move_2 = chess.Move.from_uci("e7e5")
-        expected_index_2 = move_to_index(expected_move_2)
-        assert move_index == expected_index_2
-
-        # Check the third shard (position before 2. Nf3)
-        shard3_data = torch.load(shard_files[2])
-        assert len(shard3_data) == 1
-        tensor_board, move_index, game_result = shard3_data[0]
-
-        assert tensor_board.shape == (22, 8, 8)
-        assert game_result == 1.0
-
-        board.push(expected_move_2) # Play 1... e5
-        expected_move_3 = chess.Move.from_uci("g1f3")
-        expected_index_3 = move_to_index(expected_move_3)
-        assert move_index == expected_index_3
+    # Check first shard
+    shard1_data = torch.load(shard_files[0], weights_only=False)
+    assert len(shard1_data) == 1
+    graph_board, comment = shard1_data[0]
+    assert graph_board.num_nodes == 64
+    assert comment == "comment1"

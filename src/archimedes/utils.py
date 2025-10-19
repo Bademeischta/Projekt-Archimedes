@@ -71,3 +71,59 @@ def move_to_index(move: chess.Move) -> int:
 
     move_type_plane = direction_idx * 7 + distance_idx
     return from_square * 73 + move_type_plane
+
+def index_to_move(index: int, board: chess.Board) -> chess.Move:
+    """
+    Converts an index in the 4672-dimensional action space back to a chess.Move object.
+    """
+    from_square = index // 73
+    move_type_plane = index % 73
+
+    from_rank, from_file = chess.square_rank(from_square), chess.square_file(from_square)
+
+    # 1. Underpromotions
+    if 64 <= move_type_plane < 73:
+        plane_offset = move_type_plane - 64
+        direction_idx = plane_offset // 3
+        promo_piece_idx = plane_offset % 3
+
+        promo_piece = [chess.KNIGHT, chess.BISHOP, chess.ROOK][promo_piece_idx]
+        df, dr = _PROMO_DIRECTIONS[direction_idx]
+
+        # Adjust for black's perspective
+        if from_rank == 6: # White pawn on 7th rank
+            pass
+        elif from_rank == 1: # Black pawn on 2nd rank
+            df = -df
+            dr = -dr
+
+        to_file = from_file + df
+        to_rank = from_rank + dr
+
+        return chess.Move(from_square, chess.square(to_file, to_rank), promotion=promo_piece)
+
+    # 2. Knight moves
+    if 56 <= move_type_plane < 64:
+        dr, df = _KNIGHT_MOVES[move_type_plane - 56]
+        to_rank, to_file = from_rank + dr, from_file + df
+        return chess.Move(from_square, chess.square(to_file, to_rank))
+
+    # 3. Queen-like moves
+    direction_idx = move_type_plane // 7
+    distance_idx = move_type_plane % 7
+    distance = distance_idx + 1
+
+    direction_name = _DIRECTION_PLANE_ORDER[direction_idx]
+    dr, df = _DIRECTIONS[direction_name]
+
+    to_rank = from_rank + dr * distance
+    to_file = from_file + df * distance
+
+    to_square = chess.square(to_file, to_rank)
+
+    # Check for queen promotion
+    piece = board.piece_at(from_square)
+    if piece and piece.piece_type == chess.PAWN and (to_rank == 0 or to_rank == 7):
+        return chess.Move(from_square, to_square, promotion=chess.QUEEN)
+
+    return chess.Move(from_square, to_square)

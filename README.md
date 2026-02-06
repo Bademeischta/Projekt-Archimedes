@@ -108,36 +108,75 @@ Archimedes lernt durch einen ausgeklügelten Self-Play-Mechanismus mit getrennte
 
 Für GPU-beschleunigtes Training ist Google Colab eine ausgezeichnete, kostenlose Option.
 
+#### Schnellstart mit Colab Notebook (Empfohlen)
+
+**Am einfachsten**: Verwenden Sie das fertige Colab Notebook `archimedes_colab.ipynb`:
+
+1. **Öffne das Notebook in Colab**:
+   - Laden Sie `archimedes_colab.ipynb` in Google Colab hoch, oder
+   - Klonen Sie das Repository und öffnen Sie das Notebook
+
+2. **Aktiviere GPU**:
+   - `Laufzeit` → `Laufzeittyp ändern` → `Hardwarebeschleuniger: GPU`
+
+3. **Führe die Zellen nacheinander aus**:
+   - Das Notebook führt Sie durch Installation, Setup und Training
+
+#### Manuelle Installation (Alternative)
+
+Falls Sie das Notebook nicht verwenden möchten:
+
 1.  **Öffne ein neues Colab Notebook**.
 
 2.  **Stelle die Laufzeit auf GPU um**:
-    `Laufzeit` -> `Laufzeittyp ändern` -> `Hardwarebeschleuniger: GPU`.
+    `Laufzeit` → `Laufzeittyp ändern` → `Hardwarebeschleuniger: GPU`.
 
 3.  **Klone das Repository**:
     ```python
     !git clone <repository_url>
-    %cd archimedes
+    %cd Projekt-Archimedes
     ```
 
-4.  **Installiere die Abhängigkeiten**:
+4.  **Installiere die Abhängigkeiten** (ohne Poetry):
     ```python
-    # Installiere Poetry
-    !pip install poetry
+    # Installiere Basis-Dependencies
+    !pip install -r requirements_colab.txt
 
-    # Installiere Basis-Abhängigkeiten (ohne PyTorch)
-    !poetry install
-
-    # Installiere die passende PyTorch-Version für Colab (mit CUDA)
-    # Colab hat in der Regel eine CUDA-Version vorinstalliert.
-    # Überprüfe die Version mit !nvcc --version
-    !poetry run pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu118 # oder eine andere CUDA-Version
+    # Installiere PyTorch mit CUDA Support für Colab
+    !pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
     ```
 
 5.  **Führe die Skripte aus**:
-    Du kannst die Python-Skripte direkt aus dem Notebook heraus ausführen:
     ```python
-    !poetry run python train_end_to_end.py --num-workers 2 --total-games 50
+    # Mit automatischer Konfiguration (empfohlen für Colab)
+    !python train_end_to_end.py --auto-config --total-games 100
+
+    # Oder mit manuellen Parametern (Colab-optimiert)
+    !python train_end_to_end.py --num-workers 1 --total-games 100 --batch-size 32
     ```
+
+#### Colab-spezifische Parameter-Empfehlungen
+
+Das System erkennt automatisch Colab-Umgebungen und passt die Parameter an:
+
+- **Workers**: Colab hat nur 2 CPU-Kerne → `--num-workers 1` (automatisch gesetzt)
+- **Batch-Size**: 
+  - T4 GPU: ~32 (automatisch)
+  - A100 GPU: ~64 (automatisch)
+- **Replay Buffer**: Reduziert auf ~20.000 für begrenzten RAM
+
+**Tipp**: Verwenden Sie `--auto-config` für optimale Colab-Parameter!
+
+#### Troubleshooting
+
+**Problem**: "Out of Memory" Fehler
+- **Lösung**: Reduzieren Sie `--batch-size` (z.B. `--batch-size 16`) oder `--replay-buffer-size`
+
+**Problem**: Training läuft sehr langsam
+- **Lösung**: Stellen Sie sicher, dass GPU aktiviert ist (`Laufzeit` → `Laufzeittyp ändern` → `GPU`)
+
+**Problem**: Poetry-Installation schlägt fehl
+- **Lösung**: Verwenden Sie `requirements_colab.txt` statt Poetry (siehe manuelle Installation oben)
 
 ## 5. Benutzung
 
@@ -162,22 +201,96 @@ poetry run python src/archimedes/create_dataset.py \
     --shard-size 50000
 ```
 
-### b) End-to-End-Training (`train_end_to_end.py`)
+### b) System Benchmark (`benchmark_system.py`)
+
+**NEU**: Dieses Skript benchmarkt deine Hardware (CPU, GPU, RAM) und schlägt optimale Trainingsparameter vor, um die volle Kapazität deines PCs auszunutzen, während der PC weiterhin nutzbar bleibt.
+
+**Argumente**:
+*   `--output`: (Optional) Ausgabedatei für Benchmark-Ergebnisse. Default: `benchmark_results.json`.
+*   `--skip-gpu-test`: (Optional) Überspringt GPU-Tests für schnellere Ausführung.
+
+**Beispiel**:
+```bash
+# Führe vollständigen Benchmark durch
+poetry run python benchmark_system.py
+
+# Benchmark ohne GPU-Tests (schneller)
+poetry run python benchmark_system.py --skip-gpu-test
+```
+
+Das Skript testet:
+- **CPU**: Anzahl Kerne, Geschwindigkeit, aktuelle Auslastung
+- **RAM**: Gesamter/verfügbarer Speicher, Geschwindigkeit
+- **GPU**: Speicher, Compute-Capability, optimale Batch-Size
+
+**Automatische Parameter-Optimierung**:
+- Reserviert automatisch CPU-Kerne für System-Nutzung (25% oder min. 2 Kerne)
+- Findet optimale Batch-Size basierend auf GPU-Speicher
+- Empfiehlt optimale Anzahl von Workers für DataLoader und Self-Play
+- Berechnet optimale Replay-Buffer-Größe basierend auf verfügbarem RAM
+
+### c) End-to-End-Training (`train_end_to_end.py`)
 
 Dies ist das Hauptskript, um die KI durch Self-Play zu trainieren.
 
 **Argumente**:
-*   `--num-workers`: (Optional) Anzahl der parallelen Prozesse für die Generierung von Self-Play-Spielen. Default: `2`.
+*   `--num-workers`: (Optional) Anzahl der parallelen Prozesse für die Generierung von Self-Play-Spielen. Auto-konfiguriert mit `--auto-config`.
 *   `--total-games`: (Optional) Gesamtzahl der zu spielenden Partien für den Trainingslauf. Default: `10`.
+*   `--batch-size`: (Optional) Batch-Size für Training. Auto-konfiguriert mit `--auto-config`.
+*   `--device`: (Optional) Device (cuda/cpu). Auto-detektiert wenn nicht angegeben.
+*   `--auto-config`: (Optional) **Verwendet Benchmark-Ergebnisse für optimale Konfiguration.**
+*   `--benchmark-file`: (Optional) Pfad zur Benchmark-Datei. Default: `benchmark_results.json`.
+*   `--replay-buffer-size`: (Optional) Größe des Replay-Buffers. Auto-konfiguriert mit `--auto-config`.
+
+**Beispiele**:
+```bash
+# Training mit automatischer Konfiguration (empfohlen!)
+poetry run python benchmark_system.py  # Erst Benchmark ausführen
+poetry run python train_end_to_end.py --auto-config --total-games 1000
+
+# Training mit manuellen Parametern
+poetry run python train_end_to_end.py --num-workers 4 --total-games 1000 --batch-size 64
+```
+*Hinweis: Mit `--auto-config` werden alle Parameter automatisch basierend auf deiner Hardware optimiert, sodass du die volle Kapazität ausnutzt, während der PC weiterhin nutzbar bleibt.*
+
+### d) TPN Training (`train_tpn.py`)
+
+Trainiert das Tactical Perception Network isoliert.
+
+**Argumente**:
+*   `--dataset-dir`: (Pflicht) Verzeichnis mit Trainings-Shards.
+*   `--epochs`: (Optional) Anzahl Epochen. Default: `10`.
+*   `--batch-size`: (Optional) Batch-Size. Auto-konfiguriert mit `--auto-config`.
+*   `--device`: (Optional) Device (cuda/cpu). Auto-detektiert wenn nicht angegeben.
+*   `--auto-config`: (Optional) **Verwendet Benchmark-Ergebnisse für optimale Konfiguration.**
+*   `--num-workers`: (Optional) DataLoader Workers. Auto-konfiguriert mit `--auto-config`.
+*   `--pin-memory`: (Optional) Pin Memory für DataLoader. Auto-konfiguriert mit `--auto-config`.
 
 **Beispiel**:
 ```bash
-# Starte das Training mit 4 Worker-Prozessen für insgesamt 1000 Partien
-poetry run python train_end_to_end.py --num-workers 4 --total-games 1000
+# Mit automatischer Konfiguration
+poetry run python train_tpn.py --dataset-dir ./data/shards_tpn --auto-config --epochs 20
 ```
-*Hinweis: Dieses Skript ist für verteiltes Training vorbereitet und kann mit `torch.distributed.run` für Multi-GPU- oder Multi-Node-Training gestartet werden.*
 
-### c) Elo-Bewertung (`evaluate_elo.py`)
+### e) SAN Training (`train_san.py`)
+
+Trainiert das Strategic Abstraction Network isoliert.
+
+**Argumente**:
+*   `--dataset-dir`: (Pflicht) Verzeichnis mit Trainings-Shards.
+*   `--epochs`: (Optional) Anzahl Epochen. Default: `10`.
+*   `--batch-size`: (Optional) Batch-Size. Auto-konfiguriert mit `--auto-config`.
+*   `--device`: (Optional) Device (cuda/cpu). Auto-detektiert wenn nicht angegeben.
+*   `--auto-config`: (Optional) **Verwendet Benchmark-Ergebnisse für optimale Konfiguration.**
+*   `--num-workers`: (Optional) DataLoader Workers. Auto-konfiguriert mit `--auto-config`.
+
+**Beispiel**:
+```bash
+# Mit automatischer Konfiguration
+poetry run python train_san.py --dataset-dir ./data/shards_san --auto-config --epochs 20
+```
+
+### f) Elo-Bewertung (`evaluate_elo.py`)
 
 Dieses Skript spielt Partien zwischen zwei Modell-Versionen, um deren relative Spielstärke zu messen.
 
@@ -195,7 +308,7 @@ poetry run python evaluate_elo.py \
     --num-games 50
 ```
 
-### d) TPN-Quantisierung (`quantize_tpn.py`)
+### g) TPN-Quantisierung (`quantize_tpn.py`)
 
 Dieses Skript optimiert ein trainiertes TPN-Modell für eine schnellere Inferenz auf CPUs.
 

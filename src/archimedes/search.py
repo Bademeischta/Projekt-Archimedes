@@ -1,5 +1,5 @@
 """
-MCTS-based ConceptualGraphSearch with optional TT, Dirichlet noise, and MCTS stats.
+MCTS-based ConceptualGraphSearch with time management, LRU TT, Q-normalization, and Dirichlet noise.
 """
 
 import time
@@ -7,6 +7,7 @@ import torch
 import chess
 import math
 import numpy as np
+from collections import OrderedDict
 
 from .model import TPN, SAN, PlanToMoveMapper
 from .representation import board_to_tensor, board_to_graph
@@ -27,6 +28,51 @@ class Node:
         return self.value_sum / self.visit_count
 
 
+class LRUTranspositionTable:
+    """
+    LRU (Least Recently Used) Transposition Table for MCTS.
+    Automatically evicts least recently used entries when full.
+    """
+    def __init__(self, max_size: int = 10000):
+        self.max_size = max_size
+        self.cache = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+    
+    def get(self, key: str):
+        """Get value and mark as recently used."""
+        if key in self.cache:
+            self.hits += 1
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        self.misses += 1
+        return None
+    
+    def put(self, key: str, value: float):
+        """Put value and evict LRU if necessary."""
+        if key in self.cache:
+            # Update existing entry
+            self.cache.move_to_end(key)
+        else:
+            # Add new entry
+            if len(self.cache) >= self.max_size:
+                # Evict least recently used (first item)
+                self.cache.popitem(last=False)
+            self.cache[key] = value
+    
+    def clear(self):
+        """Clear the cache and reset stats."""
+        self.cache.clear()
+        self.hits = 0
+        self.misses = 0
+    
+    @property
+    def hit_rate(self):
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
+
+
 class ConceptualGraphSearch:
     def __init__(
         self,
@@ -35,11 +81,13 @@ class ConceptualGraphSearch:
         mapper: PlanToMoveMapper,
         tactical_override_threshold: float = -0.8,
         num_simulations: int = 50,
+        time_limit: float = None,  # NEW: Time-based search (seconds)
         cpuct: float = 1.1,
         use_transposition_table: bool = False,
         tt_max_size: int = 10000,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
+        use_q_normalization: bool = True,  # NEW: Q-value normalization
     ):
         self.tpn = tpn
         self.san = san
@@ -47,21 +95,38 @@ class ConceptualGraphSearch:
         self.tactical_override_threshold = tactical_override_threshold
         self.tactical_overrides = 0
         self.num_simulations = num_simulations
+        self.time_limit = time_limit  # If set, overrides num_simulations
         self.cpuct = cpuct
         self.use_transposition_table = use_transposition_table
-        self.tt_max_size = tt_max_size
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
-        self._tt = {} if use_transposition_table else None
-        self._tt_hits = 0
-        self._tt_misses = 0
+        self.use_q_normalization = use_q_normalization
+        
+        # LRU Transposition Table
+        self._tt = LRUTranspositionTable(tt_max_size) if use_transposition_table else None
+        
+        # Q-value normalization tracking
+        self.q_min = 0.0
+        self.q_max = 1.0
 
     def clear_tt(self):
         """Clear transposition table (call between games or when desired)."""
         if self._tt is not None:
             self._tt.clear()
-        self._tt_hits = 0
-        self._tt_misses = 0
+
+    def _normalize_q(self, q_value: float) -> float:
+        """Normalize Q-value to [0, 1] using dynamic min-max tracking."""
+        if not self.use_q_normalization:
+            return q_value
+        
+        # Update min/max
+        self.q_min = min(self.q_min, q_value)
+        self.q_max = max(self.q_max, q_value)
+        
+        # Normalize
+        if self.q_max - self.q_min < 1e-8:
+            return 0.5
+        return (q_value - self.q_min) / (self.q_max - self.q_min)
 
     def _check_tactical_override(self, board: chess.Board, v_tactical: torch.Tensor) -> chess.Move | None:
         if v_tactical.item() >= self.tactical_override_threshold:
@@ -136,8 +201,23 @@ class ConceptualGraphSearch:
         puct_exploitation = []
         sim_stats = []
 
-        for _ in range(self.num_simulations):
-            self.run_simulation(board.copy(), root, 0, sim_stats)
+        # Time-based iterative deepening OR fixed simulations
+        if self.time_limit is not None:
+            # Iterative deepening with time limit
+            depth = 1
+            while (time.perf_counter() - search_start) < self.time_limit:
+                # Run simulations for current depth
+                sims_this_depth = min(10, self.num_simulations)  # Adaptive
+                for _ in range(sims_this_depth):
+                    if (time.perf_counter() - search_start) >= self.time_limit:
+                        break
+                    self.run_simulation(board.copy(), root, 0, sim_stats, max_depth=depth)
+                depth += 1
+        else:
+            # Fixed number of simulations
+            for _ in range(self.num_simulations):
+                self.run_simulation(board.copy(), root, 0, sim_stats)
+        
         for d, ex, ey in sim_stats:
             if d is not None:
                 depths.append(d)
@@ -154,10 +234,8 @@ class ConceptualGraphSearch:
         visit_counts = [c.visit_count for c in root.children.values()]
         branching = len(root.children)
         visit_histogram = np.bincount(visit_counts, minlength=min(max(visit_counts) + 1, 256)).tolist()[:32]
-        cache_hit_rate = (
-            self._tt_hits / (self._tt_hits + self._tt_misses)
-            if (self._tt_hits + self._tt_misses) > 0 else None
-        )
+        cache_hit_rate = self._tt.hit_rate if self._tt is not None else None
+        
         mcts_stats = {
             "avg_depth": avg_depth,
             "max_depth": max_depth,
@@ -167,6 +245,8 @@ class ConceptualGraphSearch:
             "puct_exploration_avg": float(np.mean(puct_exploration)) if puct_exploration else None,
             "puct_exploitation_avg": float(np.mean(puct_exploitation)) if puct_exploitation else None,
             "visit_histogram_json": None,
+            "q_min": self.q_min if self.use_q_normalization else None,
+            "q_max": self.q_max if self.use_q_normalization else None,
         }
         try:
             import json
@@ -197,9 +277,14 @@ class ConceptualGraphSearch:
     def _tt_key(self, board: chess.Board) -> str:
         return board.fen()
 
-    def run_simulation(self, board: chess.Board, node: Node, depth: int, sim_stats: list = None):
+    def run_simulation(self, board: chess.Board, node: Node, depth: int, sim_stats: list = None, max_depth: int = None):
         if sim_stats is None:
             sim_stats = []
+        
+        # Check depth limit for iterative deepening
+        if max_depth is not None and depth >= max_depth:
+            return -node.value
+        
         move, child_node = self.select_child(node, board)
         exploration_term = None
         exploitation_term = None
@@ -213,22 +298,27 @@ class ConceptualGraphSearch:
 
         if child_node.visit_count == 0:
             tt_key = self._tt_key(board) if self._tt is not None else None
-            if tt_key is not None and tt_key in self._tt:
-                value = self._tt[tt_key]
-                self._tt_hits += 1
+            if tt_key is not None:
+                cached_value = self._tt.get(tt_key)
+                if cached_value is not None:
+                    value = cached_value
+                else:
+                    tensor_board = board_to_tensor(board).unsqueeze(0)
+                    with torch.no_grad():
+                        _, value = self.tpn(tensor_board)
+                    value = value.item()
+                    self._tt.put(tt_key, value)
             else:
                 tensor_board = board_to_tensor(board).unsqueeze(0)
                 with torch.no_grad():
                     _, value = self.tpn(tensor_board)
                 value = value.item()
-                self._tt_misses += 1
-                if self._tt is not None:
-                    if len(self._tt) >= self.tt_max_size:
-                        self._tt.clear()
-                    self._tt[tt_key] = value
+            
+            # Normalize Q-value
+            value = self._normalize_q(value)
             sim_stats.append((depth + 1, exploration_term, exploitation_term))
         else:
-            value = self.run_simulation(board, child_node, depth + 1, sim_stats)
+            value = self.run_simulation(board, child_node, depth + 1, sim_stats, max_depth)
 
         child_node.visit_count += 1
         child_node.value_sum += value
@@ -244,7 +334,9 @@ class ConceptualGraphSearch:
         for move, child in node.children.items():
             if move not in legal_moves:
                 continue
-            ucb_score = child.value + self.cpuct * child.prior * (sqrt_total_visits / (1 + child.visit_count))
+            # Use normalized Q-value
+            q_value = self._normalize_q(child.value) if self.use_q_normalization else child.value
+            ucb_score = q_value + self.cpuct * child.prior * (sqrt_total_visits / (1 + child.visit_count))
             if ucb_score > best_score:
                 best_score = ucb_score
                 best_move = move

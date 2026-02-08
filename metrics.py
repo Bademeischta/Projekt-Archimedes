@@ -21,7 +21,7 @@ except ImportError:
     MP_AVAILABLE = False
 
 
-def _writer_loop(db_path: str, log_queue, stop_event, flush_event, use_mp_queue: bool):
+def _writer_loop(db_path: str, log_queue, stop_event, flush_event, use_mp_queue: bool, queue_timeout: float = 0.5):
     """Background loop: read from queue, write to SQLite. WAL mode enabled."""
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -31,7 +31,7 @@ def _writer_loop(db_path: str, log_queue, stop_event, flush_event, use_mp_queue:
     while not stop_event.is_set():
         try:
             try:
-                msg = log_queue.get(timeout=0.5)
+                msg = log_queue.get(timeout=queue_timeout)
             except (Empty, Exception):
                 msg = None
             if msg is not None:
@@ -224,10 +224,20 @@ class MetricsLogger:
     writes to SQLite. Use multiprocessing.Queue when self-play workers (other processes) log.
     """
 
-    def __init__(self, db_path: str = "training_logs.db", use_mp_queue: bool = False, run_id: str = None):
+    def __init__(self, db_path: str = "training_logs.db", use_mp_queue: bool = False, run_id: str = None, queue_timeout: float = 0.5):
+        """
+        Initialize MetricsLogger.
+        
+        Args:
+            db_path: Path to SQLite database file
+            use_mp_queue: Use multiprocessing.Queue for multi-process logging
+            run_id: Unique run identifier (auto-generated if None)
+            queue_timeout: Timeout for queue.get() in writer loop (seconds)
+        """
         self.db_path = db_path
         self.use_mp_queue = use_mp_queue and MP_AVAILABLE
         self.run_id = run_id or f"run_{int(time.time())}_{os.getpid()}"
+        self.queue_timeout = queue_timeout
 
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(db_path)
@@ -243,7 +253,7 @@ class MetricsLogger:
         self._flush_event = threading.Event()
         self._writer = threading.Thread(
             target=_writer_loop,
-            args=(db_path, self._queue, self._stop, self._flush_event, self.use_mp_queue),
+            args=(db_path, self._queue, self._stop, self._flush_event, self.use_mp_queue, self.queue_timeout),
             daemon=True,
         )
         self._writer.start()

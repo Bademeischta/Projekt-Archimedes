@@ -59,6 +59,16 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# Archimedes training
+training_logs.db
+training_logs.db-wal
+training_logs.db-shm
+latest_checkpoint.pt
+replay_buffer.pt
+checkpoints/
+logs/
+*.pt.tmp
+
 # Flask stuff:
 instance/
 .webassets-cache

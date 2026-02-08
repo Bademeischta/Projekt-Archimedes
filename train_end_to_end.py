@@ -1,16 +1,22 @@
+"""
+End-to-end training for Archimedes with resumable checkpoints, MetricsLogger,
+warmup phase, and thermal throttling.
+"""
+
+import argparse
+import json
+import os
+import random
+import time
+from collections import deque
+from pathlib import Path
+
+import chess
 import torch
-import torch.nn as nn
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-import chess
-import argparse
-from collections import deque
-import random
-import wandb
-import os
 from tqdm import tqdm
-import time
 
 from src.archimedes.model import TPN, SAN, PlanToMoveMapper
 from src.archimedes.search import ConceptualGraphSearch
@@ -18,6 +24,16 @@ from src.archimedes.rewards import calculate_sfs
 from src.archimedes.representation import board_to_tensor
 from src.archimedes.utils import move_to_index
 from src.archimedes.benchmark_utils import apply_auto_config, get_auto_config
+from src.archimedes.hardware_utils import get_hardware_snapshot, get_gpu_temp_c, check_thermal_throttle
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+from metrics import MetricsLogger
+
 
 class ReplayBuffer:
     def __init__(self, capacity):
@@ -32,16 +48,15 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+
 def self_play_worker(rank, world_size, model, replay_queue, num_games, device, use_ddp=False):
     if use_ddp:
         setup(rank, world_size)
     tpn, san, mapper = model
-    # Unwrap DDP if needed
     if use_ddp:
         tpn = tpn.module if hasattr(tpn, 'module') else tpn
         san = san.module if hasattr(san, 'module') else san
         mapper = mapper.module if hasattr(mapper, 'module') else mapper
-    # Move models to device
     tpn = tpn.to(device)
     san = san.to(device)
     mapper = mapper.to(device)
@@ -54,7 +69,7 @@ def self_play_worker(rank, world_size, model, replay_queue, num_games, device, u
         game_history = []
         move_count = 0
         while not board.is_game_over(claim_draw=True):
-            search_result = search.search(board)
+            search_result = search.search(board, temperature=1.0, add_dirichlet_noise=True)
             game_history.append((board.fen(), search_result["best_move"]))
             board.push(search_result["best_move"])
             move_count += 1
@@ -65,7 +80,7 @@ def self_play_worker(rank, world_size, model, replay_queue, num_games, device, u
 
         if rank == 0 or not use_ddp:
             replay_queue.put((game_history, final_game_result))
-        
+
         pbar.set_postfix({
             'Moves': move_count,
             'Zeit': f'{game_time:.2f}s',
@@ -75,18 +90,39 @@ def self_play_worker(rank, world_size, model, replay_queue, num_games, device, u
     if use_ddp:
         cleanup()
 
+
+def warmup_worker(replay_queue, num_games, device):
+    """Fill replay buffer with random/heuristic games (no training)."""
+    from src.archimedes.representation import board_to_tensor
+    tpn = TPN().to(device)
+    san = SAN().to(device)
+    mapper = PlanToMoveMapper().to(device)
+    search = ConceptualGraphSearch(tpn, san, mapper)
+    for _ in tqdm(range(num_games), desc="Warmup"):
+        board = chess.Board()
+        game_history = []
+        while not board.is_game_over(claim_draw=True):
+            search_result = search.search(board, temperature=1.5)
+            game_history.append((board.fen(), search_result["best_move"]))
+            board.push(search_result["best_move"])
+        result = board.result(claim_draw=True)
+        final = {"1-0": 1.0, "0-1": -1.0}.get(result, 0.0)
+        replay_queue.put((game_history, final))
+
+
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
+
 def cleanup():
     dist.destroy_process_group()
+
 
 def train_step(tpn, san, mapper, replay_buffer, batch_size, tpn_optimizer, san_optimizer, device):
     experiences = replay_buffer.sample(batch_size)
 
-    # Unwrap DDP models if needed for forward pass
     tpn_model = tpn.module if hasattr(tpn, 'module') else tpn
     san_model = san.module if hasattr(san, 'module') else san
     mapper_model = mapper.module if hasattr(mapper, 'module') else mapper
@@ -102,60 +138,116 @@ def train_step(tpn, san, mapper, replay_buffer, batch_size, tpn_optimizer, san_o
     real_sfs_list = [calculate_sfs(exp["board_after_plan"], exp["original_goal_vector"], tpn_model, san_model) for exp in experiences]
     real_sfs = torch.tensor(real_sfs_list, dtype=torch.float32, device=device).unsqueeze(1)
 
-    # TPN Loss
     tpn_optimizer.zero_grad()
     policy_loss = torch.nn.CrossEntropyLoss()(final_policies, best_move_indices)
     value_loss = torch.nn.MSELoss()(v_tacticals, game_results)
     tpn_loss = policy_loss + value_loss
     tpn_loss.backward(retain_graph=True)
+    grad_norm_tpn = torch.nn.utils.clip_grad_norm_(list(tpn_params_from(tpn)), float('inf'))
     tpn_optimizer.step()
 
-    # SAN Loss
     san_optimizer.zero_grad()
     a_sfs_loss = torch.nn.MSELoss()(a_sfs_predictions, real_sfs)
     advantages = real_sfs - a_sfs_predictions.detach()
     plan_policy_loss = -torch.mean(torch.log_softmax(plan_policies, dim=1) * advantages)
     san_loss = a_sfs_loss + plan_policy_loss
     san_loss.backward()
+    grad_norm_san = torch.nn.utils.clip_grad_norm_(list(san_params_from(san)) + list(mapper_params_from(mapper)), float('inf'))
     san_optimizer.step()
 
-    wandb.log({
+    with torch.no_grad():
+        _, pred_top = final_policies.max(1)
+        top1 = (pred_top == best_move_indices).float().mean().item()
+        top5 = (final_policies.argsort(dim=1, descending=True)[:, :5] == best_move_indices.unsqueeze(1)).any(1).float().mean().item()
+
+    grad_norm = (float(grad_norm_tpn) + float(grad_norm_san)) / 2.0
+
+    if WANDB_AVAILABLE:
+        wandb.log({
+            "tpn_loss": tpn_loss.item(), "san_loss": san_loss.item(),
+            "policy_loss": policy_loss.item(), "value_loss": value_loss.item(),
+            "a_sfs_loss": a_sfs_loss.item(), "plan_policy_loss": plan_policy_loss.item(),
+            "top1_accuracy": top1, "top5_accuracy": top5, "grad_norm": grad_norm
+        })
+
+    return {
         "tpn_loss": tpn_loss.item(), "san_loss": san_loss.item(),
         "policy_loss": policy_loss.item(), "value_loss": value_loss.item(),
-        "a_sfs_loss": a_sfs_loss.item(), "plan_policy_loss": plan_policy_loss.item()
-    })
-    
-    return {
-        "tpn_loss": tpn_loss.item(),
-        "san_loss": san_loss.item(),
-        "policy_loss": policy_loss.item(),
-        "value_loss": value_loss.item(),
-        "a_sfs_loss": a_sfs_loss.item(),
-        "plan_policy_loss": plan_policy_loss.item()
+        "a_sfs_loss": a_sfs_loss.item(), "plan_policy_loss": plan_policy_loss.item(),
+        "top1_accuracy": top1, "top5_accuracy": top5, "grad_norm": grad_norm,
     }
+
+
+def tpn_params_from(tpn):
+    return tpn.module.parameters() if hasattr(tpn, 'module') else tpn.parameters()
+
+
+def san_params_from(san):
+    return san.module.parameters() if hasattr(san, 'module') else san.parameters()
+
+
+def mapper_params_from(mapper):
+    return mapper.module.parameters() if hasattr(mapper, 'module') else mapper.parameters()
+
+
+def save_checkpoint_atomic(checkpoint_dir, state, filename="latest_checkpoint.pt"):
+    path = Path(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    final_path = path / filename
+    tmp_path = path / (filename + ".tmp")
+    torch.save(state, tmp_path)
+    os.replace(str(tmp_path), str(final_path))
+
+
+def load_checkpoint(checkpoint_dir, device, filename="latest_checkpoint.pt"):
+    path = Path(checkpoint_dir) / filename
+    if not path.exists():
+        return None
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def save_replay_buffer(buffer, checkpoint_dir, filename="replay_buffer.pt"):
+    path = Path(checkpoint_dir) / filename
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    state = list(buffer.buffer)
+    torch.save(state, path)
+
+
+def load_replay_buffer_into(buffer, checkpoint_dir, filename="replay_buffer.pt"):
+    path = Path(checkpoint_dir) / filename
+    if not path.exists():
+        return
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    cap = buffer.buffer.maxlen
+    buffer.buffer = deque(state, maxlen=cap)
+
 
 def main():
     parser = argparse.ArgumentParser(description="End-to-end training for Archimedes.")
-    parser.add_argument("--num-workers", type=int, default=None, help="Number of self-play workers. Auto-configured if --auto-config is used.")
-    parser.add_argument("--total-games", type=int, default=10, help="Total number of self-play games to generate.")
-    parser.add_argument("--device", type=str, default=None, help="Device to use (cuda/cpu). Auto-detects if not specified.")
-    parser.add_argument("--training-iterations", type=int, default=100, help="Number of training iterations.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Training batch size. Auto-configured if --auto-config is used.")
-    parser.add_argument("--auto-config", action="store_true", help="Use benchmark results for optimal configuration.")
-    parser.add_argument("--benchmark-file", type=str, default="benchmark_results.json", help="Path to benchmark results file.")
-    parser.add_argument("--replay-buffer-size", type=int, default=None, help="Replay buffer size. Auto-configured if --auto-config is used.")
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--total-games", type=int, default=10)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--training-iterations", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--auto-config", action="store_true")
+    parser.add_argument("--benchmark-file", type=str, default="benchmark_results.json")
+    parser.add_argument("--replay-buffer-size", type=int, default=None)
+    parser.add_argument("--checkpoint-dir", type=str, default=".", help="Directory for checkpoints and logs.")
+    parser.add_argument("--resume", action="store_true", default=True, help="Resume from latest checkpoint if present.")
+    parser.add_argument("--no-resume", action="store_false", dest="resume")
+    parser.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs.")
+    parser.add_argument("--save-buffer-every", type=int, default=10, help="Save replay buffer every N epochs.")
+    parser.add_argument("--warmup-games", type=int, default=0, help="Fill buffer with this many warmup games before training.")
+    parser.add_argument("--max-gpu-temp", type=float, default=85.0, help="Pause training if GPU temp (C) exceeds this.")
+    parser.add_argument("--iterations-per-epoch", type=int, default=10, help="Training iterations per epoch.")
+    parser.add_argument("--metrics-db", type=str, default=None, help="Path to training_logs.db (default: checkpoint_dir/training_logs.db).")
     args = parser.parse_args()
 
-    # Auto-Config anwenden
     if args.auto_config:
-        print("🔧 Verwende automatische Konfiguration basierend auf Benchmark...")
+        print("Using auto-config from benchmark...")
         args = apply_auto_config(args, args.benchmark_file)
-        auto_config = get_auto_config(args.device, args.benchmark_file)
-        print(f"   Self-Play Workers: {args.num_workers}")
-        print(f"   Batch-Size: {args.batch_size}")
-        print(f"   Replay Buffer Größe: {args.replay_buffer_size}")
+        print(f"   Self-Play Workers: {args.num_workers}, Batch-Size: {args.batch_size}, Replay Buffer: {args.replay_buffer_size}")
     else:
-        # Fallback-Werte wenn nicht gesetzt
         if args.num_workers is None:
             args.num_workers = 2
         if args.batch_size is None:
@@ -163,86 +255,160 @@ def main():
         if args.replay_buffer_size is None:
             args.replay_buffer_size = 10000
 
-    # GPU/Device Setup für Colab Local Runtime
+    checkpoint_dir = args.checkpoint_dir
+    metrics_db = args.metrics_db or str(Path(checkpoint_dir) / "training_logs.db")
+    use_mp = args.num_workers > 1
+    metrics_logger = MetricsLogger(db_path=metrics_db, use_mp_queue=use_mp)
+
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-    
-    print(f"Verwende Device: {device}")
+
+    if not torch.cuda.is_available():
+        print("WARNING: No GPU detected. Training will run on CPU and may be very slow.")
+
+    print(f"Device: {device}")
     if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA Version: {torch.version.cuda}")
-        print(f"GPU Speicher: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        print(f"GPU: {torch.cuda.get_device_name(0)}, CUDA: {torch.version.cuda}")
 
-    wandb.init(project="archimedes", config=args)
+    config_dict = {k: getattr(args, k) for k in dir(args) if not k.startswith('_') and isinstance(getattr(args, k), (int, float, str, bool))}
+    metrics_logger.log_run_meta(device=str(device), config=config_dict)
 
-    # Initialize models on device
+    if WANDB_AVAILABLE:
+        wandb.init(project="archimedes", config=config_dict)
+
     tpn = TPN().to(device)
     san = SAN().to(device)
     mapper = PlanToMoveMapper().to(device)
-    
-    # Only use DDP if multiple GPUs are available
     use_ddp = torch.cuda.device_count() > 1 and args.num_workers > 1
     if use_ddp:
-        print(f"Verwende {torch.cuda.device_count()} GPUs mit DDP")
         tpn = DDP(tpn)
         san = DDP(san)
         mapper = DDP(mapper)
-    else:
-        print("Verwende Single GPU/CPU (kein DDP)")
 
     replay_buffer = ReplayBuffer(args.replay_buffer_size)
     replay_queue = mp.Queue()
 
-    # Get actual model parameters (unwrap DDP if needed)
-    tpn_params = tpn.module.parameters() if hasattr(tpn, 'module') else tpn.parameters()
-    san_params = san.module.parameters() if hasattr(san, 'module') else san.parameters()
-    mapper_params = mapper.module.parameters() if hasattr(mapper, 'module') else mapper.parameters()
-    
+    tpn_params = tpn_params_from(tpn)
+    san_params = san_params_from(san)
+    mapper_params = mapper_params_from(mapper)
     tpn_optimizer = torch.optim.Adam(tpn_params)
     san_optimizer = torch.optim.Adam(list(san_params) + list(mapper_params))
+    total_iters = args.training_iterations
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(tpn_optimizer, T_max=total_iters)
+    # SAN/mapper share same scheduler step
+    scheduler_san = torch.optim.lr_scheduler.CosineAnnealingLR(san_optimizer, T_max=total_iters)
 
-    # Self-play phase
-    print(f"\nStarte Self-Play Phase mit {args.num_workers} Workern für {args.total_games} Spiele...")
-    self_play_start = time.time()
-    
-    if args.num_workers > 1 and use_ddp:
-        world_size = args.num_workers
-        mp.spawn(self_play_worker,
-                 args=(world_size, (tpn, san, mapper), replay_queue, args.total_games // world_size, device, use_ddp),
-                 nprocs=world_size,
-                 join=True)
-    else:
-        # Single worker mode (better for Colab local runtime)
-        print("Verwende Single-Worker Modus (optimal für Colab Local Runtime)")
-        self_play_worker(0, 1, (tpn, san, mapper), replay_queue, args.total_games, device, False)
-    
-    self_play_time = time.time() - self_play_start
-    print(f"Self-Play Phase abgeschlossen in {self_play_time:.2f} Sekunden ({self_play_time/60:.2f} Minuten)")
-
-    # Process games and train
-    print(f"\nVerarbeite Spiele und starte Training...")
-    training_start = time.time()
-    games_processed = 0
-    
-    pbar = tqdm(total=args.training_iterations, desc="Training Iterationen")
+    start_epoch = 0
     training_iteration = 0
-    
-    while training_iteration < args.training_iterations:
-        # Process games from queue
-        games_processed_this_iter = 0
-        while not replay_queue.empty() and games_processed_this_iter < 10:
-            game_history, final_game_result = replay_queue.get()
+
+    ckpt = load_checkpoint(checkpoint_dir, device) if args.resume else None
+    if ckpt is not None:
+        tpn_loaded = tpn.module if hasattr(tpn, 'module') else tpn
+        san_loaded = san.module if hasattr(san, 'module') else san
+        mapper_loaded = mapper.module if hasattr(mapper, 'module') else mapper
+        tpn_loaded.load_state_dict(ckpt["tpn_state_dict"])
+        san_loaded.load_state_dict(ckpt["san_state_dict"])
+        mapper_loaded.load_state_dict(ckpt["mapper_state_dict"])
+        if "tpn_optimizer" in ckpt:
+            tpn_optimizer.load_state_dict(ckpt["tpn_optimizer"])
+        if "san_optimizer" in ckpt:
+            san_optimizer.load_state_dict(ckpt["san_optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if "scheduler_san" in ckpt:
+            scheduler_san.load_state_dict(ckpt["scheduler_san"])
+        start_epoch = ckpt.get("epoch", 0)
+        training_iteration = ckpt.get("training_iteration", 0)
+        print(f"Resumed from epoch {start_epoch}, iteration {training_iteration}")
+        load_replay_buffer_into(replay_buffer, checkpoint_dir)
+
+    if args.warmup_games > 0 and len(replay_buffer) < args.batch_size:
+        print(f"Warmup: filling buffer with {args.warmup_games} games...")
+        warmup_worker(replay_queue, args.warmup_games, device)
+        while not replay_queue.empty() and len(replay_buffer) < args.replay_buffer_size:
+            try:
+                game_history, final_game_result = replay_queue.get_nowait()
+            except Exception:
+                break
             board = chess.Board()
+            tpn_m = tpn.module if hasattr(tpn, 'module') else tpn
+            san_m = san.module if hasattr(san, 'module') else san
+            mapper_m = mapper.module if hasattr(mapper, 'module') else mapper
+            search = ConceptualGraphSearch(tpn_m, san_m, mapper_m)
             for fen, move in game_history:
                 board.set_fen(fen)
-                # Unwrap DDP models if needed
-                tpn_model = tpn.module if hasattr(tpn, 'module') else tpn
-                san_model = san.module if hasattr(san, 'module') else san
-                mapper_model = mapper.module if hasattr(mapper, 'module') else mapper
-                search_result = ConceptualGraphSearch(tpn_model, san_model, mapper_model).search(board)
+                search_result = search.search(board)
+                experience = {
+                    "board_tensor": board_to_tensor(board),
+                    "final_policy": search_result["final_policy"],
+                    "v_tactical": search_result["v_tactical"],
+                    "a_sfs_prediction": search_result["a_sfs_prediction"],
+                    "original_goal_vector": search_result["original_goal_vector"],
+                    "board_after_plan": search_result["board_after_plan"],
+                    "best_move_index": move_to_index(move),
+                    "plan_policy": search_result["plan_policy"],
+                    "final_game_result": final_game_result
+                }
+                replay_buffer.push(experience)
+                final_game_result *= -1
+        print(f"Warmup done. Buffer size: {len(replay_buffer)}")
 
+    print(f"\nSelf-Play: {args.num_workers} workers, {args.total_games} games...")
+    self_play_start = time.time()
+    if args.num_workers > 1 and use_ddp:
+        mp.spawn(
+            self_play_worker,
+            args=(args.num_workers, (tpn, san, mapper), replay_queue, args.total_games // args.num_workers, device, use_ddp),
+            nprocs=args.num_workers,
+            join=True
+        )
+    else:
+        self_play_worker(0, 1, (tpn, san, mapper), replay_queue, args.total_games, device, False)
+    self_play_time = time.time() - self_play_start
+    print(f"Self-Play finished in {self_play_time:.2f}s")
+
+    training_start = time.time()
+    games_processed = 0
+    epoch = start_epoch
+    pbar = tqdm(initial=training_iteration, total=total_iters, desc="Training")
+    epoch_loss_sum = None
+    epoch_acc_sum = None
+    epoch_count = 0
+
+    while training_iteration < total_iters:
+        if args.max_gpu_temp > 0 and check_thermal_throttle(args.max_gpu_temp):
+            metrics_logger.log_ticker(f"Thermal throttle: GPU temp >= {args.max_gpu_temp}C, pausing 60s")
+            print(f"GPU temp >= {args.max_gpu_temp}C, pausing 60s...")
+            time.sleep(60)
+            continue
+
+        hw = get_hardware_snapshot()
+        metrics_logger.log_hardware(
+            timestamp=hw["timestamp"],
+            gpu_utilization_pct=hw.get("gpu_utilization_pct"),
+            vram_mb=hw.get("vram_mb"),
+            gpu_temp_c=hw.get("gpu_temp_c"),
+            cpu_load_pct=hw.get("cpu_load_pct"),
+            ram_mb=hw.get("ram_mb"),
+            disk_io_read=hw.get("disk_io_read"),
+            disk_io_write=hw.get("disk_io_write"),
+        )
+
+        while not replay_queue.empty() and games_processed < args.total_games * 2:
+            try:
+                game_history, final_game_result = replay_queue.get_nowait()
+            except Exception:
+                break
+            board = chess.Board()
+            tpn_m = tpn.module if hasattr(tpn, 'module') else tpn
+            san_m = san.module if hasattr(san, 'module') else san
+            mapper_m = mapper.module if hasattr(mapper, 'module') else mapper
+            search = ConceptualGraphSearch(tpn_m, san_m, mapper_m)
+            for fen, move in game_history:
+                board.set_fen(fen)
+                search_result = search.search(board)
                 experience = {
                     "board_tensor": board_to_tensor(board).to(device),
                     "final_policy": search_result["final_policy"].to(device),
@@ -257,36 +423,113 @@ def main():
                 replay_buffer.push(experience)
                 final_game_result *= -1
             games_processed += 1
-            games_processed_this_iter += 1
 
-        # Training step
-        if len(replay_buffer) > 32:
+        if len(replay_buffer) >= args.batch_size:
             iter_start = time.time()
-            loss_dict = train_step(tpn, san, mapper, replay_buffer, 32, tpn_optimizer, san_optimizer, device)
-            iter_time = time.time() - iter_start
-            
+            loss_dict = train_step(tpn, san, mapper, replay_buffer, args.batch_size, tpn_optimizer, san_optimizer, device)
+            scheduler.step()
+            scheduler_san.step()
             training_iteration += 1
+            lr = scheduler.get_last_lr()[0]
+
+            if epoch_loss_sum is None:
+                epoch_loss_sum = {k: 0.0 for k in loss_dict}
+                epoch_acc_sum = {"top1": 0.0, "top5": 0.0}
+                epoch_count = 0
+            for k in loss_dict:
+                if k in epoch_loss_sum:
+                    epoch_loss_sum[k] += loss_dict[k]
+            if "top1_accuracy" in loss_dict:
+                epoch_acc_sum["top1"] += loss_dict["top1_accuracy"]
+                epoch_acc_sum["top5"] += loss_dict["top5_accuracy"]
+            epoch_count += 1
+
+            metrics_logger.log_batch(
+                epoch=epoch,
+                batch_idx=training_iteration,
+                total_loss=loss_dict.get("tpn_loss", 0) + loss_dict.get("san_loss", 0),
+                policy_loss=loss_dict.get("policy_loss"),
+                value_loss=loss_dict.get("value_loss"),
+                lr=lr,
+                grad_norm=loss_dict.get("grad_norm"),
+            )
+
             pbar.update(1)
             pbar.set_postfix({
-                'TPN Loss': f'{loss_dict["tpn_loss"]:.4f}',
-                'SAN Loss': f'{loss_dict["san_loss"]:.4f}',
-                'Iter Zeit': f'{iter_time:.2f}s',
+                'TPN': f'{loss_dict["tpn_loss"]:.4f}',
+                'SAN': f'{loss_dict["san_loss"]:.4f}',
                 'Buffer': f'{len(replay_buffer)}/{args.replay_buffer_size}'
             })
-            
-            if training_iteration < args.training_iterations:
-                remaining_iters = args.training_iterations - training_iteration
-                estimated_remaining = iter_time * remaining_iters
-                if training_iteration % 10 == 0:
-                    print(f"\nIteration {training_iteration}/{args.training_iterations}")
-                    print(f"  Geschätzte verbleibende Zeit: {estimated_remaining:.2f} Sekunden ({estimated_remaining/60:.2f} Minuten)")
-    
+
+            iters_this_epoch = training_iteration % args.iterations_per_epoch if args.iterations_per_epoch else 1
+            if args.iterations_per_epoch and (training_iteration % args.iterations_per_epoch == 0):
+                epoch += 1
+                dur = time.time() - training_start
+                avg_loss = {k: epoch_loss_sum[k] / epoch_count for k in epoch_loss_sum} if epoch_count else {}
+                top1_avg = epoch_acc_sum["top1"] / epoch_count if epoch_count else 0
+                top5_avg = epoch_acc_sum["top5"] / epoch_count if epoch_count else 0
+                metrics_logger.log_epoch_summary(
+                    epoch=epoch,
+                    total_loss=avg_loss.get("tpn_loss", 0) + avg_loss.get("san_loss", 0),
+                    policy_loss=avg_loss.get("policy_loss"),
+                    value_loss=avg_loss.get("value_loss"),
+                    a_sfs_loss=avg_loss.get("a_sfs_loss"),
+                    plan_policy_loss=avg_loss.get("plan_policy_loss"),
+                    train_loss_avg=avg_loss.get("tpn_loss"),
+                    val_loss_avg=None,
+                    lr=lr,
+                    grad_norm=avg_loss.get("grad_norm"),
+                    top1_accuracy=top1_avg,
+                    top5_accuracy=top5_avg,
+                    duration_sec=dur,
+                    num_samples=epoch_count * args.batch_size,
+                )
+                epoch_loss_sum = None
+                epoch_acc_sum = None
+                epoch_count = 0
+
+                if args.save_every and (epoch % args.save_every == 0):
+                    tpn_sd = tpn.module.state_dict() if hasattr(tpn, 'module') else tpn.state_dict()
+                    san_sd = san.module.state_dict() if hasattr(san, 'module') else san.state_dict()
+                    mapper_sd = mapper.module.state_dict() if hasattr(mapper, 'module') else mapper.state_dict()
+                    save_checkpoint_atomic(checkpoint_dir, {
+                        "tpn_state_dict": tpn_sd,
+                        "san_state_dict": san_sd,
+                        "mapper_state_dict": mapper_sd,
+                        "tpn_optimizer": tpn_optimizer.state_dict(),
+                        "san_optimizer": san_optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "scheduler_san": scheduler_san.state_dict(),
+                        "epoch": epoch,
+                        "training_iteration": training_iteration,
+                    })
+                    metrics_logger.log_ticker(f"Checkpoint saved at epoch {epoch}")
+
+                if args.save_buffer_every and (epoch % args.save_buffer_every == 0):
+                    save_replay_buffer(replay_buffer, checkpoint_dir)
+                    metrics_logger.log_ticker(f"Replay buffer saved at epoch {epoch}")
+
     pbar.close()
-    total_training_time = time.time() - training_start
-    print(f"\n=== Training abgeschlossen ===")
-    print(f"Gesamte Trainingszeit: {total_training_time:.2f} Sekunden ({total_training_time/60:.2f} Minuten)")
-    print(f"Spiele verarbeitet: {games_processed}")
-    print(f"Training Iterationen: {training_iteration}")
+    total_time = time.time() - training_start
+    print(f"\nTraining done. Time: {total_time:.2f}s, Games processed: {games_processed}, Iterations: {training_iteration}")
+
+    tpn_sd = tpn.module.state_dict() if hasattr(tpn, 'module') else tpn.state_dict()
+    san_sd = san.module.state_dict() if hasattr(san, 'module') else san.state_dict()
+    mapper_sd = mapper.module.state_dict() if hasattr(mapper, 'module') else mapper.state_dict()
+    save_checkpoint_atomic(checkpoint_dir, {
+        "tpn_state_dict": tpn_sd,
+        "san_state_dict": san_sd,
+        "mapper_state_dict": mapper_sd,
+        "tpn_optimizer": tpn_optimizer.state_dict(),
+        "san_optimizer": san_optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scheduler_san": scheduler_san.state_dict(),
+        "epoch": epoch,
+        "training_iteration": training_iteration,
+    })
+    metrics_logger.flush()
+    metrics_logger.shutdown()
+
 
 if __name__ == "__main__":
     main()

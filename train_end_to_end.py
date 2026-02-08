@@ -1,6 +1,6 @@
 """
 End-to-end training for Archimedes with resumable checkpoints, MetricsLogger,
-warmup phase, and thermal throttling.
+warmup phase, thermal throttling, AMP (Automatic Mixed Precision), and advanced schedulers.
 """
 
 import argparse
@@ -16,6 +16,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from src.archimedes.model import TPN, SAN, PlanToMoveMapper
@@ -110,6 +111,47 @@ def warmup_worker(replay_queue, num_games, device):
         replay_queue.put((game_history, final))
 
 
+def drain_replay_queue(replay_queue, replay_buffer, tpn, san, mapper, device, max_drain=None):
+    """
+    Robust drain mechanism: Process all games in the queue and add to replay buffer.
+    Returns number of games drained.
+    """
+    games_drained = 0
+    tpn_m = tpn.module if hasattr(tpn, 'module') else tpn
+    san_m = san.module if hasattr(san, 'module') else san
+    mapper_m = mapper.module if hasattr(mapper, 'module') else mapper
+    search = ConceptualGraphSearch(tpn_m, san_m, mapper_m)
+    
+    while not replay_queue.empty():
+        if max_drain is not None and games_drained >= max_drain:
+            break
+        try:
+            game_history, final_game_result = replay_queue.get_nowait()
+        except Exception:
+            break
+        
+        board = chess.Board()
+        for fen, move in game_history:
+            board.set_fen(fen)
+            search_result = search.search(board)
+            experience = {
+                "board_tensor": board_to_tensor(board).to(device),
+                "final_policy": search_result["final_policy"].to(device),
+                "v_tactical": search_result["v_tactical"].to(device),
+                "a_sfs_prediction": search_result["a_sfs_prediction"].to(device),
+                "original_goal_vector": search_result["original_goal_vector"].to(device),
+                "board_after_plan": search_result["board_after_plan"],
+                "best_move_index": move_to_index(move),
+                "plan_policy": search_result["plan_policy"].to(device),
+                "final_game_result": final_game_result
+            }
+            replay_buffer.push(experience)
+            final_game_result *= -1
+        games_drained += 1
+    
+    return games_drained
+
+
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
@@ -120,7 +162,10 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def train_step(tpn, san, mapper, replay_buffer, batch_size, tpn_optimizer, san_optimizer, device):
+def train_step(tpn, san, mapper, replay_buffer, batch_size, tpn_optimizer, san_optimizer, device, scaler=None):
+    """
+    Training step with optional AMP (Automatic Mixed Precision).
+    """
     experiences = replay_buffer.sample(batch_size)
 
     tpn_model = tpn.module if hasattr(tpn, 'module') else tpn
@@ -138,22 +183,48 @@ def train_step(tpn, san, mapper, replay_buffer, batch_size, tpn_optimizer, san_o
     real_sfs_list = [calculate_sfs(exp["board_after_plan"], exp["original_goal_vector"], tpn_model, san_model) for exp in experiences]
     real_sfs = torch.tensor(real_sfs_list, dtype=torch.float32, device=device).unsqueeze(1)
 
-    tpn_optimizer.zero_grad()
-    policy_loss = torch.nn.CrossEntropyLoss()(final_policies, best_move_indices)
-    value_loss = torch.nn.MSELoss()(v_tacticals, game_results)
-    tpn_loss = policy_loss + value_loss
-    tpn_loss.backward(retain_graph=True)
-    grad_norm_tpn = torch.nn.utils.clip_grad_norm_(list(tpn_params_from(tpn)), float('inf'))
-    tpn_optimizer.step()
+    use_amp = scaler is not None and device.type == 'cuda'
 
+    # TPN Training with AMP
+    tpn_optimizer.zero_grad()
+    if use_amp:
+        with autocast():
+            policy_loss = torch.nn.CrossEntropyLoss()(final_policies, best_move_indices)
+            value_loss = torch.nn.MSELoss()(v_tacticals, game_results)
+            tpn_loss = policy_loss + value_loss
+        scaler.scale(tpn_loss).backward(retain_graph=True)
+        scaler.unscale_(tpn_optimizer)
+        grad_norm_tpn = torch.nn.utils.clip_grad_norm_(list(tpn_params_from(tpn)), float('inf'))
+        scaler.step(tpn_optimizer)
+    else:
+        policy_loss = torch.nn.CrossEntropyLoss()(final_policies, best_move_indices)
+        value_loss = torch.nn.MSELoss()(v_tacticals, game_results)
+        tpn_loss = policy_loss + value_loss
+        tpn_loss.backward(retain_graph=True)
+        grad_norm_tpn = torch.nn.utils.clip_grad_norm_(list(tpn_params_from(tpn)), float('inf'))
+        tpn_optimizer.step()
+
+    # SAN Training with AMP
     san_optimizer.zero_grad()
-    a_sfs_loss = torch.nn.MSELoss()(a_sfs_predictions, real_sfs)
-    advantages = real_sfs - a_sfs_predictions.detach()
-    plan_policy_loss = -torch.mean(torch.log_softmax(plan_policies, dim=1) * advantages)
-    san_loss = a_sfs_loss + plan_policy_loss
-    san_loss.backward()
-    grad_norm_san = torch.nn.utils.clip_grad_norm_(list(san_params_from(san)) + list(mapper_params_from(mapper)), float('inf'))
-    san_optimizer.step()
+    if use_amp:
+        with autocast():
+            a_sfs_loss = torch.nn.MSELoss()(a_sfs_predictions, real_sfs)
+            advantages = real_sfs - a_sfs_predictions.detach()
+            plan_policy_loss = -torch.mean(torch.log_softmax(plan_policies, dim=1) * advantages)
+            san_loss = a_sfs_loss + plan_policy_loss
+        scaler.scale(san_loss).backward()
+        scaler.unscale_(san_optimizer)
+        grad_norm_san = torch.nn.utils.clip_grad_norm_(list(san_params_from(san)) + list(mapper_params_from(mapper)), float('inf'))
+        scaler.step(san_optimizer)
+        scaler.update()
+    else:
+        a_sfs_loss = torch.nn.MSELoss()(a_sfs_predictions, real_sfs)
+        advantages = real_sfs - a_sfs_predictions.detach()
+        plan_policy_loss = -torch.mean(torch.log_softmax(plan_policies, dim=1) * advantages)
+        san_loss = a_sfs_loss + plan_policy_loss
+        san_loss.backward()
+        grad_norm_san = torch.nn.utils.clip_grad_norm_(list(san_params_from(san)) + list(mapper_params_from(mapper)), float('inf'))
+        san_optimizer.step()
 
     with torch.no_grad():
         _, pred_top = final_policies.max(1)
@@ -241,6 +312,9 @@ def main():
     parser.add_argument("--max-gpu-temp", type=float, default=85.0, help="Pause training if GPU temp (C) exceeds this.")
     parser.add_argument("--iterations-per-epoch", type=int, default=10, help="Training iterations per epoch.")
     parser.add_argument("--metrics-db", type=str, default=None, help="Path to training_logs.db (default: checkpoint_dir/training_logs.db).")
+    parser.add_argument("--use-amp", action="store_true", default=True, help="Use Automatic Mixed Precision (AMP) for faster training.")
+    parser.add_argument("--no-amp", action="store_false", dest="use_amp")
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine", "plateau", "none"], help="Learning rate scheduler type.")
     args = parser.parse_args()
 
     if args.auto_config:
@@ -267,10 +341,12 @@ def main():
 
     if not torch.cuda.is_available():
         print("WARNING: No GPU detected. Training will run on CPU and may be very slow.")
+        args.use_amp = False  # Disable AMP on CPU
 
     print(f"Device: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}, CUDA: {torch.version.cuda}")
+        print(f"AMP (Automatic Mixed Precision): {'Enabled' if args.use_amp else 'Disabled'}")
 
     config_dict = {k: getattr(args, k) for k in dir(args) if not k.startswith('_') and isinstance(getattr(args, k), (int, float, str, bool))}
     metrics_logger.log_run_meta(device=str(device), config=config_dict)
@@ -293,12 +369,26 @@ def main():
     tpn_params = tpn_params_from(tpn)
     san_params = san_params_from(san)
     mapper_params = mapper_params_from(mapper)
-    tpn_optimizer = torch.optim.Adam(tpn_params)
-    san_optimizer = torch.optim.Adam(list(san_params) + list(mapper_params))
+    tpn_optimizer = torch.optim.Adam(tpn_params, lr=0.001)
+    san_optimizer = torch.optim.Adam(list(san_params) + list(mapper_params), lr=0.001)
+    
+    # Initialize AMP GradScaler
+    scaler = GradScaler() if args.use_amp and device.type == 'cuda' else None
+    
+    # Learning Rate Schedulers
     total_iters = args.training_iterations
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(tpn_optimizer, T_max=total_iters)
-    # SAN/mapper share same scheduler step
-    scheduler_san = torch.optim.lr_scheduler.CosineAnnealingLR(san_optimizer, T_max=total_iters)
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(tpn_optimizer, T_0=total_iters // 4, T_mult=2)
+        scheduler_san = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(san_optimizer, T_0=total_iters // 4, T_mult=2)
+        print(f"Using CosineAnnealingWarmRestarts scheduler")
+    elif args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(tpn_optimizer, mode='min', factor=0.5, patience=10)
+        scheduler_san = torch.optim.lr_scheduler.ReduceLROnPlateau(san_optimizer, mode='min', factor=0.5, patience=10)
+        print(f"Using ReduceLROnPlateau scheduler")
+    else:
+        scheduler = None
+        scheduler_san = None
+        print(f"No scheduler used")
 
     start_epoch = 0
     training_iteration = 0
@@ -315,45 +405,24 @@ def main():
             tpn_optimizer.load_state_dict(ckpt["tpn_optimizer"])
         if "san_optimizer" in ckpt:
             san_optimizer.load_state_dict(ckpt["san_optimizer"])
-        if "scheduler" in ckpt:
+        if "scheduler" in ckpt and scheduler is not None:
             scheduler.load_state_dict(ckpt["scheduler"])
-        if "scheduler_san" in ckpt:
+        if "scheduler_san" in ckpt and scheduler_san is not None:
             scheduler_san.load_state_dict(ckpt["scheduler_san"])
+        if "scaler" in ckpt and scaler is not None:
+            scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt.get("epoch", 0)
         training_iteration = ckpt.get("training_iteration", 0)
         print(f"Resumed from epoch {start_epoch}, iteration {training_iteration}")
         load_replay_buffer_into(replay_buffer, checkpoint_dir)
 
+    # Warmup phase with robust drain
     if args.warmup_games > 0 and len(replay_buffer) < args.batch_size:
         print(f"Warmup: filling buffer with {args.warmup_games} games...")
         warmup_worker(replay_queue, args.warmup_games, device)
-        while not replay_queue.empty() and len(replay_buffer) < args.replay_buffer_size:
-            try:
-                game_history, final_game_result = replay_queue.get_nowait()
-            except Exception:
-                break
-            board = chess.Board()
-            tpn_m = tpn.module if hasattr(tpn, 'module') else tpn
-            san_m = san.module if hasattr(san, 'module') else san
-            mapper_m = mapper.module if hasattr(mapper, 'module') else mapper
-            search = ConceptualGraphSearch(tpn_m, san_m, mapper_m)
-            for fen, move in game_history:
-                board.set_fen(fen)
-                search_result = search.search(board)
-                experience = {
-                    "board_tensor": board_to_tensor(board),
-                    "final_policy": search_result["final_policy"],
-                    "v_tactical": search_result["v_tactical"],
-                    "a_sfs_prediction": search_result["a_sfs_prediction"],
-                    "original_goal_vector": search_result["original_goal_vector"],
-                    "board_after_plan": search_result["board_after_plan"],
-                    "best_move_index": move_to_index(move),
-                    "plan_policy": search_result["plan_policy"],
-                    "final_game_result": final_game_result
-                }
-                replay_buffer.push(experience)
-                final_game_result *= -1
-        print(f"Warmup done. Buffer size: {len(replay_buffer)}")
+        print(f"Draining warmup queue...")
+        games_drained = drain_replay_queue(replay_queue, replay_buffer, tpn, san, mapper, device)
+        print(f"Warmup done. Buffer size: {len(replay_buffer)}, Games drained: {games_drained}")
 
     print(f"\nSelf-Play: {args.num_workers} workers, {args.total_games} games...")
     self_play_start = time.time()
@@ -396,41 +465,25 @@ def main():
             disk_io_write=hw.get("disk_io_write"),
         )
 
-        while not replay_queue.empty() and games_processed < args.total_games * 2:
-            try:
-                game_history, final_game_result = replay_queue.get_nowait()
-            except Exception:
-                break
-            board = chess.Board()
-            tpn_m = tpn.module if hasattr(tpn, 'module') else tpn
-            san_m = san.module if hasattr(san, 'module') else san
-            mapper_m = mapper.module if hasattr(mapper, 'module') else mapper
-            search = ConceptualGraphSearch(tpn_m, san_m, mapper_m)
-            for fen, move in game_history:
-                board.set_fen(fen)
-                search_result = search.search(board)
-                experience = {
-                    "board_tensor": board_to_tensor(board).to(device),
-                    "final_policy": search_result["final_policy"].to(device),
-                    "v_tactical": search_result["v_tactical"].to(device),
-                    "a_sfs_prediction": search_result["a_sfs_prediction"].to(device),
-                    "original_goal_vector": search_result["original_goal_vector"].to(device),
-                    "board_after_plan": search_result["board_after_plan"],
-                    "best_move_index": move_to_index(move),
-                    "plan_policy": search_result["plan_policy"].to(device),
-                    "final_game_result": final_game_result
-                }
-                replay_buffer.push(experience)
-                final_game_result *= -1
-            games_processed += 1
+        # Drain replay queue
+        games_drained = drain_replay_queue(replay_queue, replay_buffer, tpn, san, mapper, device, max_drain=10)
+        games_processed += games_drained
 
         if len(replay_buffer) >= args.batch_size:
             iter_start = time.time()
-            loss_dict = train_step(tpn, san, mapper, replay_buffer, args.batch_size, tpn_optimizer, san_optimizer, device)
-            scheduler.step()
-            scheduler_san.step()
+            loss_dict = train_step(tpn, san, mapper, replay_buffer, args.batch_size, tpn_optimizer, san_optimizer, device, scaler)
+            
+            # Update schedulers
+            if scheduler is not None:
+                if args.scheduler == "plateau":
+                    scheduler.step(loss_dict["tpn_loss"])
+                    scheduler_san.step(loss_dict["san_loss"])
+                else:
+                    scheduler.step()
+                    scheduler_san.step()
+            
             training_iteration += 1
-            lr = scheduler.get_last_lr()[0]
+            lr = tpn_optimizer.param_groups[0]['lr']
 
             if epoch_loss_sum is None:
                 epoch_loss_sum = {k: 0.0 for k in loss_dict}
@@ -458,6 +511,7 @@ def main():
             pbar.set_postfix({
                 'TPN': f'{loss_dict["tpn_loss"]:.4f}',
                 'SAN': f'{loss_dict["san_loss"]:.4f}',
+                'LR': f'{lr:.6f}',
                 'Buffer': f'{len(replay_buffer)}/{args.replay_buffer_size}'
             })
 
@@ -492,17 +546,21 @@ def main():
                     tpn_sd = tpn.module.state_dict() if hasattr(tpn, 'module') else tpn.state_dict()
                     san_sd = san.module.state_dict() if hasattr(san, 'module') else san.state_dict()
                     mapper_sd = mapper.module.state_dict() if hasattr(mapper, 'module') else mapper.state_dict()
-                    save_checkpoint_atomic(checkpoint_dir, {
+                    checkpoint_state = {
                         "tpn_state_dict": tpn_sd,
                         "san_state_dict": san_sd,
                         "mapper_state_dict": mapper_sd,
                         "tpn_optimizer": tpn_optimizer.state_dict(),
                         "san_optimizer": san_optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "scheduler_san": scheduler_san.state_dict(),
                         "epoch": epoch,
                         "training_iteration": training_iteration,
-                    })
+                    }
+                    if scheduler is not None:
+                        checkpoint_state["scheduler"] = scheduler.state_dict()
+                        checkpoint_state["scheduler_san"] = scheduler_san.state_dict()
+                    if scaler is not None:
+                        checkpoint_state["scaler"] = scaler.state_dict()
+                    save_checkpoint_atomic(checkpoint_dir, checkpoint_state)
                     metrics_logger.log_ticker(f"Checkpoint saved at epoch {epoch}")
 
                 if args.save_buffer_every and (epoch % args.save_buffer_every == 0):
@@ -516,17 +574,21 @@ def main():
     tpn_sd = tpn.module.state_dict() if hasattr(tpn, 'module') else tpn.state_dict()
     san_sd = san.module.state_dict() if hasattr(san, 'module') else san.state_dict()
     mapper_sd = mapper.module.state_dict() if hasattr(mapper, 'module') else mapper.state_dict()
-    save_checkpoint_atomic(checkpoint_dir, {
+    final_checkpoint = {
         "tpn_state_dict": tpn_sd,
         "san_state_dict": san_sd,
         "mapper_state_dict": mapper_sd,
         "tpn_optimizer": tpn_optimizer.state_dict(),
         "san_optimizer": san_optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "scheduler_san": scheduler_san.state_dict(),
         "epoch": epoch,
         "training_iteration": training_iteration,
-    })
+    }
+    if scheduler is not None:
+        final_checkpoint["scheduler"] = scheduler.state_dict()
+        final_checkpoint["scheduler_san"] = scheduler_san.state_dict()
+    if scaler is not None:
+        final_checkpoint["scaler"] = scaler.state_dict()
+    save_checkpoint_atomic(checkpoint_dir, final_checkpoint)
     metrics_logger.flush()
     metrics_logger.shutdown()
 

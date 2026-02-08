@@ -4,48 +4,84 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, global_mean_pool
 from torch_geometric.data import Data
 
+
+class ResidualBlock(nn.Module):
+    """
+    Residual Block with Batch Normalization for the TPN.
+    Implements: out = ReLU(BN(Conv(x)) + x)
+    """
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = F.relu(out)
+        return out
+
+
 class TPN(nn.Module):
     """
-    Tactical Perception Network (TPN)
-    A convolutional network that takes a tensor representation of the board
+    Tactical Perception Network (TPN) - ResNet Edition
+    A deep residual convolutional network that takes a tensor representation of the board
     and outputs a policy and a value.
+    
+    Architecture:
+    - Initial convolution layer (22 -> 256 channels)
+    - 10 Residual Blocks with Batch Normalization
+    - Dual-head output (Policy & Value)
     """
-    def __init__(self):
+    def __init__(self, num_res_blocks=10, num_channels=256):
         super(TPN, self).__init__()
         # Input shape: (N, 22, 8, 8)
-
-        # Body
-        self.conv1 = nn.Conv2d(22, 128, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-
+        
+        # Initial convolution
+        self.conv_initial = nn.Conv2d(22, num_channels, kernel_size=3, padding=1, bias=False)
+        self.bn_initial = nn.BatchNorm2d(num_channels)
+        
+        # Residual tower (5-10 blocks)
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(num_channels) for _ in range(num_res_blocks)
+        ])
+        
         # Policy Head
-        self.policy_conv = nn.Conv2d(128, 2, kernel_size=1)
-        self.policy_fc = nn.Linear(2 * 8 * 8, 4672)
-
+        self.policy_conv = nn.Conv2d(num_channels, 32, kernel_size=1, bias=False)
+        self.policy_bn = nn.BatchNorm2d(32)
+        self.policy_fc = nn.Linear(32 * 8 * 8, 4672)
+        
         # Value Head
-        self.value_conv = nn.Conv2d(128, 1, kernel_size=1)
-        self.value_fc1 = nn.Linear(1 * 8 * 8, 64)
-        self.value_fc2 = nn.Linear(64, 1)
-
+        self.value_conv = nn.Conv2d(num_channels, 32, kernel_size=1, bias=False)
+        self.value_bn = nn.BatchNorm2d(32)
+        self.value_fc1 = nn.Linear(32 * 8 * 8, 256)
+        self.value_fc2 = nn.Linear(256, 1)
+        
     def forward(self, x):
-        # Body
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-
+        # Initial convolution
+        x = F.relu(self.bn_initial(self.conv_initial(x)))
+        
+        # Residual tower
+        for res_block in self.res_blocks:
+            x = res_block(x)
+        
         # Policy Head
-        p = F.relu(self.policy_conv(x))
-        p = p.view(p.size(0), -1) # Flatten
+        p = F.relu(self.policy_bn(self.policy_conv(x)))
+        p = p.view(p.size(0), -1)  # Flatten
         p = self.policy_fc(p)
-
+        
         # Value Head
-        v = F.relu(self.value_conv(x))
-        v = v.view(v.size(0), -1) # Flatten
+        v = F.relu(self.value_bn(self.value_conv(x)))
+        v = v.view(v.size(0), -1)  # Flatten
         v = F.relu(self.value_fc1(v))
         v = torch.tanh(self.value_fc2(v))
-
+        
         return p, v
+
 
 class SAN(nn.Module):
     """
@@ -86,6 +122,7 @@ class SAN(nn.Module):
         a_sfs_prediction = self.a_sfs_head(x)
 
         return goal_vector, plan_embeddings, plan_policy, a_sfs_prediction
+
 
 class PlanToMoveMapper(nn.Module):
     """

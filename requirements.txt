@@ -1,0 +1,23 @@
+# Archimedes: training + dashboard
+# Install PyTorch separately for your CUDA version if needed, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+torch>=2.0.0
+torch-geometric>=2.3.1
+python-chess>=1.999
+numpy<2.0
+tqdm>=4.66.0
+psutil>=5.9.0
+wandb>=0.16.2
+
+# Dashboard
+streamlit>=1.28.0
+plotly>=5.18.0
+pandas>=1.5.0
+pyngrok>=7.0.0
+
+# Hardware metrics (optional)
+pynvml>=11.5.0
+
+# GNN viz / t-SNE (optional)
+scikit-learn>=1.2.0

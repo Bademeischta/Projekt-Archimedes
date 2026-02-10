@@ -102,6 +102,9 @@ class ConceptualGraphSearch:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.use_q_normalization = use_q_normalization
         
+        # Determine device from models
+        self.device = next(tpn.parameters()).device
+
         # LRU Transposition Table
         self._tt = LRUTranspositionTable(tt_max_size) if use_transposition_table else None
         
@@ -139,7 +142,7 @@ class ConceptualGraphSearch:
             board.push(move)
             next_board_tensors.append(board_to_tensor(board))
             board.pop()
-        batch = torch.stack(next_board_tensors)
+        batch = torch.stack(next_board_tensors).to(self.device)
         with torch.no_grad():
             _, v_tactical_opponents = self.tpn(batch)
         for i, move in enumerate(legal_moves):
@@ -158,8 +161,8 @@ class ConceptualGraphSearch:
         root = Node(prior=0)
         search_start = time.perf_counter()
 
-        tensor_board = board_to_tensor(board).unsqueeze(0)
-        graph_board = board_to_graph(board)
+        tensor_board = board_to_tensor(board).unsqueeze(0).to(self.device)
+        graph_board = board_to_graph(board).to(self.device)
         with torch.no_grad():
             policy_logits, v_tactical = self.tpn(tensor_board)
             goal_vector, plan_embeddings, plan_policy, a_sfs_prediction = self.san(graph_board)
@@ -303,13 +306,13 @@ class ConceptualGraphSearch:
                 if cached_value is not None:
                     value = cached_value
                 else:
-                    tensor_board = board_to_tensor(board).unsqueeze(0)
+                    tensor_board = board_to_tensor(board).unsqueeze(0).to(self.device)
                     with torch.no_grad():
                         _, value = self.tpn(tensor_board)
                     value = value.item()
                     self._tt.put(tt_key, value)
             else:
-                tensor_board = board_to_tensor(board).unsqueeze(0)
+                tensor_board = board_to_tensor(board).unsqueeze(0).to(self.device)
                 with torch.no_grad():
                     _, value = self.tpn(tensor_board)
                 value = value.item()

@@ -17,8 +17,11 @@ def calculate_sfs(
     """
     Calculates the Strategic Fulfillment Score (SFS) for a given plan.
     """
+    # Determine device from models
+    device = next(tpn.parameters()).device
+
     # 1. S_goal: Goal Achievement
-    graph_after_plan = board_to_graph(board_after_plan)
+    graph_after_plan = board_to_graph(board_after_plan).to(device)
     with torch.no_grad():
         new_goal_vector, _, _, _ = san(graph_after_plan)
 
@@ -26,7 +29,7 @@ def calculate_sfs(
 
     # 2. S_resilience: Resilience (Stresstest)
     # Get the initial tactical value of the position
-    tensor_after_plan = board_to_tensor(board_after_plan).unsqueeze(0)
+    tensor_after_plan = board_to_tensor(board_after_plan).unsqueeze(0).to(device)
     with torch.no_grad():
         _, initial_v_tactical = tpn(tensor_after_plan)
     initial_v_tactical = initial_v_tactical.item()
@@ -38,7 +41,7 @@ def calculate_sfs(
         min_v_tactical_for_us = float('inf')
         for move in board_after_plan.legal_moves:
             board_after_plan.push(move)
-            tensor_counter = board_to_tensor(board_after_plan).unsqueeze(0)
+            tensor_counter = board_to_tensor(board_after_plan).unsqueeze(0).to(device)
             with torch.no_grad():
                 _, v_tactical_opponent = tpn(tensor_counter)
             # The opponent's value is the negative of ours

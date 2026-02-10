@@ -83,7 +83,7 @@ class ConceptualGraphSearch:
         num_simulations: int = 50,
         time_limit: float = None,  # NEW: Time-based search (seconds)
         cpuct: float = 1.1,
-        use_transposition_table: bool = False,
+        use_transposition_table: bool = True,  # FIXED: Enable by default for performance
         tt_max_size: int = 10000,
         dirichlet_alpha: float = 0.3,
         dirichlet_epsilon: float = 0.25,
@@ -145,11 +145,20 @@ class ConceptualGraphSearch:
         batch = torch.stack(next_board_tensors).to(self.device)
         with torch.no_grad():
             _, v_tactical_opponents = self.tpn(batch)
+        
+        # FIXED: Find first truly safe move that doesn't give opponent advantage
         for i, move in enumerate(legal_moves):
-            if v_tactical_opponents[i].item() > -self.tactical_override_threshold:
+            # If opponent's value after this move is below threshold, it's safe
+            if v_tactical_opponents[i].item() < -self.tactical_override_threshold:
                 self.tactical_overrides += 1
-                safe_moves = [m for m in legal_moves if m != move]
-                return safe_moves[0] if safe_moves else next(iter(legal_moves))
+                return move
+        
+        # If no safe move found, return best of bad options (least bad)
+        if len(legal_moves) > 0:
+            best_idx = torch.argmax(v_tactical_opponents).item()
+            self.tactical_overrides += 1
+            return legal_moves[best_idx]
+        
         return None
 
     def search(
@@ -169,11 +178,14 @@ class ConceptualGraphSearch:
 
         override_move = self._check_tactical_override(board, v_tactical)
         if override_move:
+            # FIXED: Correctly return board_after_plan as Board object, not OrderedDict
+            board_after_plan = board.copy()
+            board_after_plan.push(override_move)
             return {
                 "best_move": override_move,
                 "a_sfs_prediction": a_sfs_prediction,
                 "original_goal_vector": goal_vector,
-                "board_after_plan": board.copy().push(override_move),
+                "board_after_plan": board_after_plan,
                 "final_policy": torch.zeros_like(policy_logits),
                 "v_tactical": v_tactical,
                 "plan_policy": torch.zeros_like(plan_policy),

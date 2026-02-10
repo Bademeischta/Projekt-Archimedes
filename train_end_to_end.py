@@ -131,6 +131,8 @@ def drain_replay_queue(replay_queue, replay_buffer, tpn, san, mapper, device, ma
             break
         
         board = chess.Board()
+        # FIXED: Use separate variable to avoid shadowing
+        current_result = final_game_result
         for fen, move in game_history:
             board.set_fen(fen)
             search_result = search.search(board)
@@ -143,10 +145,10 @@ def drain_replay_queue(replay_queue, replay_buffer, tpn, san, mapper, device, ma
                 "board_after_plan": search_result["board_after_plan"],
                 "best_move_index": move_to_index(move),
                 "plan_policy": search_result["plan_policy"].to(device),
-                "final_game_result": final_game_result
+                "final_game_result": current_result
             }
             replay_buffer.push(experience)
-            final_game_result *= -1
+            current_result *= -1
         games_drained += 1
     
     return games_drained
@@ -271,10 +273,13 @@ def save_checkpoint_atomic(checkpoint_dir, state, filename="latest_checkpoint.pt
 
 
 def load_checkpoint(checkpoint_dir, device, filename="latest_checkpoint.pt"):
+    """
+    FIXED: Use weights_only=True to prevent arbitrary code execution
+    """
     path = Path(checkpoint_dir) / filename
     if not path.exists():
         return None
-    return torch.load(path, map_location=device, weights_only=False)
+    return torch.load(path, map_location=device, weights_only=True)
 
 
 def save_replay_buffer(buffer, checkpoint_dir, filename="replay_buffer.pt"):
@@ -285,10 +290,13 @@ def save_replay_buffer(buffer, checkpoint_dir, filename="replay_buffer.pt"):
 
 
 def load_replay_buffer_into(buffer, checkpoint_dir, filename="replay_buffer.pt"):
+    """
+    FIXED: Use weights_only=True to prevent arbitrary code execution
+    """
     path = Path(checkpoint_dir) / filename
     if not path.exists():
         return
-    state = torch.load(path, map_location="cpu", weights_only=False)
+    state = torch.load(path, map_location="cpu", weights_only=True)
     cap = buffer.buffer.maxlen
     buffer.buffer = deque(state, maxlen=cap)
 

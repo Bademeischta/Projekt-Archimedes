@@ -32,7 +32,8 @@ def pgn_parser(pgn_handle: IO) -> Iterator[Tuple[torch.Tensor, Data, str, chess.
             move = node.move
             board.push(move)
             comment = node.comment
-            if comment:
-                tensor_board = board_to_tensor(board)
-                graph_board = board_to_graph(board)
-                yield tensor_board, graph_board, comment, move
+            # FIXED: Process all positions, not just those with comments
+            # Empty comments are still valuable for training
+            tensor_board = board_to_tensor(board)
+            graph_board = board_to_graph(board)
+            yield tensor_board, graph_board, comment, move

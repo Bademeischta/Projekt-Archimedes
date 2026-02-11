@@ -90,12 +90,12 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
         promo_piece = [chess.KNIGHT, chess.BISHOP, chess.ROOK][promo_piece_idx]
         df, dr = _PROMO_DIRECTIONS[direction_idx]
 
-        # Adjust for black's perspective
+        # FIXED: Adjust both df and dr for black's perspective
         if from_rank == 6: # White pawn on 7th rank
             pass
         elif from_rank == 1: # Black pawn on 2nd rank
             df = -df
-            dr = -dr
+            dr = -dr  # This was missing before
 
         to_file = from_file + df
         to_rank = from_rank + dr

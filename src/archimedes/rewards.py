@@ -35,21 +35,26 @@ def calculate_sfs(
     initial_v_tactical = initial_v_tactical.item()
 
     # Simulate 1-2 counter-moves and find the worst-case tactical value
+    # FIXED: Batch-process all counter-moves instead of O(n) individual TPN calls
     worst_v_tactical = initial_v_tactical
     if not board_after_plan.is_game_over():
-        # Find the opponent's best response, which minimizes our tactical value
-        min_v_tactical_for_us = float('inf')
-        for move in board_after_plan.legal_moves:
+        # Collect all counter-move positions as a batch
+        counter_tensors = []
+        legal_moves_list = list(board_after_plan.legal_moves)
+        for move in legal_moves_list:
             board_after_plan.push(move)
-            tensor_counter = board_to_tensor(board_after_plan).unsqueeze(0).to(device)
-            with torch.no_grad():
-                _, v_tactical_opponent = tpn(tensor_counter)
-            # The opponent's value is the negative of ours
-            v_tactical_for_us = -v_tactical_opponent.item()
-            if v_tactical_for_us < min_v_tactical_for_us:
-                min_v_tactical_for_us = v_tactical_for_us
+            counter_tensors.append(board_to_tensor(board_after_plan))
             board_after_plan.pop()
-        worst_v_tactical = min_v_tactical_for_us if min_v_tactical_for_us != float('inf') else initial_v_tactical
+        
+        if counter_tensors:
+            # Batch inference: single TPN call for all counter-moves
+            counter_batch = torch.stack(counter_tensors).to(device)
+            with torch.no_grad():
+                _, v_tactical_opponents = tpn(counter_batch)
+            # Find worst-case: opponent's best response minimizes our value
+            worst_v_tactical = -v_tactical_opponents.min().item()
+        else:
+            worst_v_tactical = initial_v_tactical
 
     # Resilience is the negative of the drop in value (higher is better)
     s_resilience = -(initial_v_tactical - worst_v_tactical)
